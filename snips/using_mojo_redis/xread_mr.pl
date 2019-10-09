@@ -7,46 +7,65 @@ use Data::Dumper;
 use Mojo::Redis;
 use Time::HiRes qw(time);
 use Mojo::IOLoop::Signal;
+use Getopt::Std qw(getopts);
 
 use constant {
-    STREAM_CHAN		 => 'someshit',
-    STREAM_ID_FILE	 => 'stream_id',
-    DFLT_START_STREAM_ID => 0,
+    DFLT_STREAM_CHAN		=> 'someshit',
+    DFLT_STREAM_ID_FILE		=> 'stream_id',
+    DFLT_START_STREAM_ID	=> 0,
+    DFLT_ADD_EVERY		=> 0.5,
+    DFLT_READ_EVERY             => 0.2,
 };
 
+getopts 'A:R:n:f:i:', \my %opts;
+my $streamName		= $opts{'n'} // DFLT_STREAM_CHAN;
+my $streamIdFile        = $opts{'f'} // DFLT_STREAM_ID_FILE;
+my $addEvery 		= $opts{'A'} // DFLT_ADD_EVERY;
+my $readEvery           = $opts{'R'} // DFLT_READ_EVERY;
+index($streamIdFile, '{{STREAM}}') > 0 and $streamIdFile =~ s%\{\{STREAM\}\}%${streamName}%g;
+
+my $streamID = my $initStreamID =
+    ( defined($opts{'i'}) && $opts{'i'} =~ /^\d+(?:-\d+)?$/ )
+        ? $opts{'i'}
+        : ( -f $streamIdFile ) 
+            ? do {
+                open my $fh, '<', $streamIdFile or die "Cant read ${streamIdFile}: $@";
+                chomp($_ = <$fh>);
+                /^\d+-\d+$/ ? $_ : DFLT_START_STREAM_ID
+              }
+            : DFLT_START_STREAM_ID;
+        
 my $mr = Mojo::Redis->new;
 my $redc = $mr->db;
 
-my $streamID = my $initStreamID =
-    ( -f STREAM_ID_FILE ) 
-        ? do {
-            open my $fh, '<', STREAM_ID_FILE;
-            chomp($_ = <$fh>);
-            /^\d+-\d+$/ ? $_ : DFLT_START_STREAM_ID
-          }
-        : DFLT_START_STREAM_ID;
+my $xr = XRead::Printer->new;
+my $xa = XRead::Printer->new('xadd');
 
-Mojo::IOLoop->recurring(0.5 => sub {
-    $redc->xadd_p(STREAM_CHAN, '*', 'ts' => $cur_ts = time)
-         ->then(sub { say 'xadd: ts ' . $cur_ts })
+Mojo::IOLoop->recurring($addEvery => sub {
+    my $cur_ts = time;
+    $redc->xadd_p($streamName, '*', 'ts' => $cur_ts)
+         ->then(sub { 
+             $xa->next('tell' => 'pushed record with ts=%g', $cur_ts)
+         })
+         ->catch(sub {
+             $xa->next('tell' => 'CATCHED: %s', $_[0])
+         })
 });
 
-my $xp = XRead::Printer->new;
-Mojo::IOLoop->recurring(0.2 => sub {
-    $redc->xread_p('STREAMS', STREAM_CHAN, $streamID)
+Mojo::IOLoop->recurring($readEvery => sub {
+    $redc->xread_p('STREAMS', $streamName, $streamID)
          ->then(sub {
             my $entries = eval { $_[0][0][1] };
-            $xp->next;
-            $xp->tell_delta;
+            $xr->next('tell_delta');
             unless ( defined($entries) and @{$entries} ) {
-                $xp->tell('no new entries?')
+                $xr->tell('no new entries?')
             } else {
                 $streamID = $entries->[$#{$entries}][0];
-                $xp->tell('data: %s', Dumper( turn2hr( $entries, 1 ) ));
+                $xr->tell('data: %s', Dumper( turn2hr( $entries, 1 ) ))
             }
         })
         ->catch(sub {
-            say 'Oh, f*ck, exception!! ' . Dumper(\@_)
+            $xr->next('tell' => 'CATCHED: %s', Dumper(\@_))
         })
 });
 
@@ -76,7 +95,7 @@ sub turn2hr {
 
 END {
     if ( defined($streamID) and $streamID ne $initStreamID ) {
-        open my $fh, '>', STREAM_ID_FILE;
+        open my $fh, '>', $streamIdFile;
         print $fh $streamID;
         close $fh;
     }
@@ -95,7 +114,16 @@ sub new {
     bless [0, $_[1] // DFLT_STR, time], ref($_[0]) || $_[0]
 }
 
-sub next { $_[0][CNT]++ }
+sub next { 
+    my $me = shift;
+    my $cnt = ++$me->[CNT];
+    return $cnt unless @_;
+    my $methodName = shift;
+    if (defined($methodName) and ! ref($methodName) and my $methodRef = $me->can($methodName)) {
+        unshift @_, $me;
+        goto &{$methodRef}
+    }
+}
 
 sub tell {
     my $me = shift;
@@ -105,5 +133,5 @@ sub tell {
 sub tell_delta {
     my $me = shift;
     my $prv_ts = $me->[TS];
-    $me->tell('after %s ms', int(1000 * (($me->[TS] = time) - $prv_ts)) / 1000 );
+    $me->tell('after %s ms', int(1000 * (($me->[TS] = time) - $prv_ts)) );
 }
